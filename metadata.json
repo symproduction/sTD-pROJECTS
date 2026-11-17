@@ -1,0 +1,6 @@
+{
+  "name": "MediAI – Your Smart Health Assistant",
+  "description": "AI-powered healthcare platform for educational health guidance, medical report explanation, and verified medicine information.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
