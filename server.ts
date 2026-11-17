@@ -10,6 +10,8 @@ import {
   explainMedicalReport,
   getMedicineInformation,
   isAiConfigured,
+  isGeminiConfigured,
+  isOpenAiConfigured,
   type ChatTurn,
 } from "./server/aiServices.ts";
 
@@ -95,6 +97,10 @@ async function startServer() {
     res.json({
       ok: true,
       aiConfigured: isAiConfigured(),
+      providers: {
+        gemini: isGeminiConfigured(),
+        openai: isOpenAiConfigured(),
+      },
     });
   });
 

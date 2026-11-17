@@ -72,17 +72,27 @@ export interface MedicineInfoResult {
   sources: MedicineSource[];
 }
 
-const MODEL_NAME = "gemini-4-hydrogen";
+const GEMINI_MODEL = "gemini-4-hydrogen";
+const OPENAI_MODEL = "gpt-4o-mini";
 
-export function isAiConfigured(): boolean {
+export function isGeminiConfigured(): boolean {
   const key = process.env.GEMINI_API_KEY?.trim();
   return Boolean(key && key !== "MY_GEMINI_API_KEY");
 }
 
-function getAiClient(): GoogleGenAI {
-  if (!isAiConfigured()) {
+export function isOpenAiConfigured(): boolean {
+  const key = process.env.OPENAI_API_KEY?.trim();
+  return Boolean(key && key !== "MY_OPENAI_API_KEY");
+}
+
+export function isAiConfigured(): boolean {
+  return isGeminiConfigured() || isOpenAiConfigured();
+}
+
+function getGeminiClient(): GoogleGenAI {
+  if (!isGeminiConfigured()) {
     throw new ApiConfigError(
-      "AI features require a valid GEMINI_API_KEY environment variable configured on the server."
+      "Primary AI provider (GEMINI_API_KEY) is not configured on the server."
     );
   }
   return new GoogleGenAI({
@@ -96,6 +106,86 @@ function getAiClient(): GoogleGenAI {
   });
 }
 
+type OpenAiContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "file"; file: { filename: string; file_data: string } };
+
+interface OpenAiMessage {
+  role: "system" | "user" | "assistant";
+  content: string | OpenAiContentPart[];
+}
+
+async function callOpenAiJson<T>(
+  messages: OpenAiMessage[],
+  timeoutMs = 45000
+): Promise<T> {
+  if (!isOpenAiConfigured()) {
+    throw new ApiConfigError(
+      "Fallback AI provider (OPENAI_API_KEY) is not configured on the server."
+    );
+  }
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY!.trim()}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      response_format: { type: "json_object" },
+      messages,
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const err = new Error(`OpenAI API error (${res.status}): ${errText}`) as Error & {
+      status?: number;
+    };
+    err.status = res.status;
+    throw err;
+  }
+
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data.choices?.[0]?.message?.content?.trim() || "{}";
+  return JSON.parse(content) as T;
+}
+
+/**
+ * Executes Gemini as the primary AI provider and automatically fails over to OpenAI
+ * if Gemini is unavailable, hits quota/rate limits, or times out (when OPENAI_API_KEY is set).
+ */
+async function withProviderFailover<T>(
+  geminiFn: () => Promise<T>,
+  openAiFn: () => Promise<T>
+): Promise<T> {
+  if (!isGeminiConfigured() && !isOpenAiConfigured()) {
+    throw new ApiConfigError(
+      "AI features require GEMINI_API_KEY (or fallback OPENAI_API_KEY) configured in server Secrets."
+    );
+  }
+
+  if (isGeminiConfigured()) {
+    try {
+      return await geminiFn();
+    } catch (geminiErr) {
+      if (isOpenAiConfigured()) {
+        const errMsg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
+        console.warn("[MediAI] Primary Gemini request failed; failing over to OpenAI:", errMsg);
+        return await openAiFn();
+      }
+      throw geminiErr;
+    }
+  }
+
+  return await openAiFn();
+}
+
 /**
  * Feature 1: AI Health Assistant
  * Provides educational, plain-English health information without diagnosing or prescribing.
@@ -105,8 +195,6 @@ export async function askHealthAssistant(
   history: ChatTurn[],
   question: string
 ): Promise<HealthAssistantResult> {
-  const ai = getAiClient();
-
   const systemInstruction = `You are MediAI Health Assistant, a patient-friendly healthcare education assistant.
 Strict clinical safety rules:
 1. Explain health concepts in clear, calm, simple English that any patient can understand.
@@ -118,61 +206,15 @@ Strict clinical safety rules:
    - If ANY emergency red-flag symptom is present, set isEmergency to true, provide a concise urgent emergencyGuidance message instructing them to call local emergency services (such as 911) or go to the nearest emergency room immediately, and keep the reply calm, direct, and focused on immediate safety.
 7. Keep responses well-structured, concise (roughly 120-260 words), and practical.`;
 
-  const contents = [
-    ...history.slice(-12).map((turn) => ({
-      role: turn.role === "assistant" ? "model" : "user",
-      parts: [{ text: turn.content }],
-    })),
-    {
-      role: "user",
-      parts: [{ text: question }],
-    },
-  ];
-
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents,
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          reply: {
-            type: Type.STRING,
-            description: "Clear, plain-English educational health response.",
-          },
-          isEmergency: {
-            type: Type.BOOLEAN,
-            description: "True if the user described urgent or life-threatening emergency symptoms.",
-          },
-          emergencyGuidance: {
-            type: Type.STRING,
-            description:
-              "Immediate action notice advising emergency services if isEmergency is true; otherwise empty string.",
-          },
-          suggestedFollowUps: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: "2 to 3 short relevant follow-up educational questions the user might ask next.",
-          },
-        },
-        required: ["reply", "isEmergency", "emergencyGuidance", "suggestedFollowUps"],
-      },
-    },
-  });
-
-  const rawText = (response.text ?? "{}").trim();
-  const parsed = JSON.parse(rawText) as {
+  const normalizeResult = (parsed: {
     reply?: string;
     isEmergency?: boolean;
     emergencyGuidance?: string;
     suggestedFollowUps?: string[];
-  };
-
-  return {
-    reply: parsed.reply?.trim() || "I could not generate an educational response for that question. Please try rephrasing.",
+  }): HealthAssistantResult => ({
+    reply:
+      parsed.reply?.trim() ||
+      "I could not generate an educational response for that question. Please try rephrasing.",
     isEmergency: Boolean(parsed.isEmergency),
     emergencyGuidance: parsed.isEmergency
       ? parsed.emergencyGuidance?.trim() ||
@@ -181,7 +223,89 @@ Strict clinical safety rules:
     suggestedFollowUps: Array.isArray(parsed.suggestedFollowUps)
       ? parsed.suggestedFollowUps.slice(0, 3)
       : [],
-  };
+  });
+
+  return withProviderFailover(
+    async () => {
+      const ai = getGeminiClient();
+      const contents = [
+        ...history.slice(-12).map((turn) => ({
+          role: turn.role === "assistant" ? "model" : "user",
+          parts: [{ text: turn.content }],
+        })),
+        {
+          role: "user",
+          parts: [{ text: question }],
+        },
+      ];
+
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents,
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reply: {
+                type: Type.STRING,
+                description: "Clear, plain-English educational health response.",
+              },
+              isEmergency: {
+                type: Type.BOOLEAN,
+                description:
+                  "True if the user described urgent or life-threatening emergency symptoms.",
+              },
+              emergencyGuidance: {
+                type: Type.STRING,
+                description:
+                  "Immediate action notice advising emergency services if isEmergency is true; otherwise empty string.",
+              },
+              suggestedFollowUps: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description:
+                  "2 to 3 short relevant follow-up educational questions the user might ask next.",
+              },
+            },
+            required: ["reply", "isEmergency", "emergencyGuidance", "suggestedFollowUps"],
+          },
+        },
+      });
+
+      return normalizeResult(JSON.parse((response.text ?? "{}").trim()));
+    },
+    async () => {
+      const jsonFormatInstruction = `${systemInstruction}
+
+Return ONLY valid JSON with exact keys:
+{
+  "reply": string,
+  "isEmergency": boolean,
+  "emergencyGuidance": string,
+  "suggestedFollowUps": string[]
+}`;
+      const messages: OpenAiMessage[] = [
+        { role: "system", content: jsonFormatInstruction },
+        ...history.slice(-12).map((turn) => ({
+          role: turn.role,
+          content: turn.content,
+        })),
+        { role: "user", content: question },
+      ];
+
+      const parsed = await callOpenAiJson<{
+        reply?: string;
+        isEmergency?: boolean;
+        emergencyGuidance?: string;
+        suggestedFollowUps?: string[];
+      }>(messages);
+
+      return normalizeResult(parsed);
+    }
+  );
 }
 
 /**
@@ -195,8 +319,6 @@ export async function explainMedicalReport(
   fileName: string,
   extraNotes?: string
 ): Promise<ReportAnalysisResult> {
-  const ai = getAiClient();
-
   const systemInstruction = `You are MediAI Medical Report Explainer, an educational clinical-literacy assistant.
 Strict accuracy and medical safety rules:
 1. Examine ONLY what is actually readable in the uploaded document (${fileName}).
@@ -211,151 +333,197 @@ Strict accuracy and medical safety rules:
     ? `Please review this uploaded medical report and extract its structured educational explanation. Patient context note: "${extraNotes.trim()}". Remember: never invent missing numbers or reference ranges.`
     : `Please review this uploaded medical report and extract its structured educational explanation. Remember: never invent missing numbers or reference ranges.`;
 
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType,
-            data: fileBuffer.toString("base64"),
-          },
-        },
-        { text: promptText },
-      ],
-    },
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          reportOverview: {
-            type: Type.STRING,
-            description: "High-level summary of the document type, panels shown, and readability.",
-          },
-          testNames: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: "List of laboratory or clinical test names explicitly visible in the report.",
-          },
-          observedValues: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                testName: { type: Type.STRING },
-                observedValue: { type: Type.STRING },
-                unit: { type: Type.STRING },
-                referenceRange: { type: Type.STRING },
-                flagStatus: {
-                  type: Type.STRING,
-                  description: "One of: within_range, outside_range, not_specified",
-                },
-                explanation: { type: Type.STRING },
-              },
-              required: [
-                "testName",
-                "observedValue",
-                "unit",
-                "referenceRange",
-                "flagStatus",
-                "explanation",
-              ],
-            },
-          },
-          referenceRangesNote: {
-            type: Type.STRING,
-            description:
-              "Summary of reference ranges shown in the report and explicit reminder that reference ranges vary across laboratories.",
-          },
-          valuesOutsideRange: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                testName: { type: Type.STRING },
-                observedValue: { type: Type.STRING },
-                referenceRange: { type: Type.STRING },
-                note: { type: Type.STRING },
-              },
-              required: ["testName", "observedValue", "referenceRange", "note"],
-            },
-            description:
-              "Only values explicitly flagged or outside the stated reference range on the report. Empty array if none or if ranges were not provided.",
-          },
-          simpleExplanation: {
-            type: Type.STRING,
-            description: "Plain-English educational explanation of what these tests measure without diagnosing.",
-          },
-          questionsForDoctor: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: "Practical questions for the patient to discuss with their healthcare provider.",
-          },
-          isInsufficientInfo: {
-            type: Type.BOOLEAN,
-            description: "True if document is unreadable, non-medical, or lacks sufficient values/ranges.",
-          },
-          limitationsNote: {
-            type: Type.STRING,
-            description: "Clear explanation of any missing data, image quality issues, or limitations; empty string if none.",
-          },
-        },
-        required: [
-          "reportOverview",
-          "testNames",
-          "observedValues",
-          "referenceRangesNote",
-          "valuesOutsideRange",
-          "simpleExplanation",
-          "questionsForDoctor",
-          "isInsufficientInfo",
-          "limitationsNote",
-        ],
-      },
-    },
-  });
+  const normalizeReport = (parsed: Partial<ReportAnalysisResult>): ReportAnalysisResult => {
+    const normalizedObserved: ObservedValueItem[] = Array.isArray(parsed.observedValues)
+      ? parsed.observedValues.map((item) => ({
+          testName: item.testName || "Unspecified test",
+          observedValue: item.observedValue || "Not readable",
+          unit: item.unit || "—",
+          referenceRange: item.referenceRange || "Not specified in report",
+          flagStatus:
+            item.flagStatus === "within_range" || item.flagStatus === "outside_range"
+              ? item.flagStatus
+              : "not_specified",
+          explanation: item.explanation || "",
+        }))
+      : [];
 
-  const rawText = (response.text ?? "{}").trim();
-  const parsed = JSON.parse(rawText) as Partial<ReportAnalysisResult>;
-
-  const normalizedObserved: ObservedValueItem[] = Array.isArray(parsed.observedValues)
-    ? parsed.observedValues.map((item) => ({
-        testName: item.testName || "Unspecified test",
-        observedValue: item.observedValue || "Not readable",
-        unit: item.unit || "—",
-        referenceRange: item.referenceRange || "Not specified in report",
-        flagStatus:
-          item.flagStatus === "within_range" || item.flagStatus === "outside_range"
-            ? item.flagStatus
-            : "not_specified",
-        explanation: item.explanation || "",
-      }))
-    : [];
-
-  return {
-    reportOverview:
-      parsed.reportOverview?.trim() || "Unable to summarize the uploaded document clearly.",
-    testNames: Array.isArray(parsed.testNames) ? parsed.testNames : [],
-    observedValues: normalizedObserved,
-    referenceRangesNote:
-      parsed.referenceRangesNote?.trim() ||
-      "Reference ranges can vary between laboratories depending on testing equipment, methods, and patient context. Always interpret results using the specific laboratory range on your official report and with your clinician.",
-    valuesOutsideRange: Array.isArray(parsed.valuesOutsideRange) ? parsed.valuesOutsideRange : [],
-    simpleExplanation:
-      parsed.simpleExplanation?.trim() ||
-      "Not enough readable test detail was available to provide a plain-language explanation.",
-    questionsForDoctor: Array.isArray(parsed.questionsForDoctor)
-      ? parsed.questionsForDoctor
-      : [
-          "How do these results relate to my symptoms and medical history?",
-          "Are any repeat tests or follow-up evaluations needed?",
-        ],
-    isInsufficientInfo: Boolean(parsed.isInsufficientInfo),
-    limitationsNote: parsed.limitationsNote?.trim() || null,
+    return {
+      reportOverview:
+        parsed.reportOverview?.trim() || "Unable to summarize the uploaded document clearly.",
+      testNames: Array.isArray(parsed.testNames) ? parsed.testNames : [],
+      observedValues: normalizedObserved,
+      referenceRangesNote:
+        parsed.referenceRangesNote?.trim() ||
+        "Reference ranges can vary between laboratories depending on testing equipment, methods, and patient context. Always interpret results using the specific laboratory range on your official report and with your clinician.",
+      valuesOutsideRange: Array.isArray(parsed.valuesOutsideRange)
+        ? parsed.valuesOutsideRange
+        : [],
+      simpleExplanation:
+        parsed.simpleExplanation?.trim() ||
+        "Not enough readable test detail was available to provide a plain-language explanation.",
+      questionsForDoctor: Array.isArray(parsed.questionsForDoctor)
+        ? parsed.questionsForDoctor
+        : [
+            "How do these results relate to my symptoms and medical history?",
+            "Are any repeat tests or follow-up evaluations needed?",
+          ],
+      isInsufficientInfo: Boolean(parsed.isInsufficientInfo),
+      limitationsNote: parsed.limitationsNote?.trim() || null,
+    };
   };
+
+  return withProviderFailover(
+    async () => {
+      const ai = getGeminiClient();
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data: fileBuffer.toString("base64"),
+              },
+            },
+            { text: promptText },
+          ],
+        },
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reportOverview: {
+                type: Type.STRING,
+                description: "High-level summary of the document type, panels shown, and readability.",
+              },
+              testNames: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "List of laboratory or clinical test names explicitly visible in the report.",
+              },
+              observedValues: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    testName: { type: Type.STRING },
+                    observedValue: { type: Type.STRING },
+                    unit: { type: Type.STRING },
+                    referenceRange: { type: Type.STRING },
+                    flagStatus: {
+                      type: Type.STRING,
+                      description: "One of: within_range, outside_range, not_specified",
+                    },
+                    explanation: { type: Type.STRING },
+                  },
+                  required: [
+                    "testName",
+                    "observedValue",
+                    "unit",
+                    "referenceRange",
+                    "flagStatus",
+                    "explanation",
+                  ],
+                },
+              },
+              referenceRangesNote: {
+                type: Type.STRING,
+                description:
+                  "Summary of reference ranges shown in the report and explicit reminder that reference ranges vary across laboratories.",
+              },
+              valuesOutsideRange: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    testName: { type: Type.STRING },
+                    observedValue: { type: Type.STRING },
+                    referenceRange: { type: Type.STRING },
+                    note: { type: Type.STRING },
+                  },
+                  required: ["testName", "observedValue", "referenceRange", "note"],
+                },
+                description:
+                  "Only values explicitly flagged or outside the stated reference range on the report. Empty array if none or if ranges were not provided.",
+              },
+              simpleExplanation: {
+                type: Type.STRING,
+                description:
+                  "Plain-English educational explanation of what these tests measure without diagnosing.",
+              },
+              questionsForDoctor: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Practical questions for the patient to discuss with their healthcare provider.",
+              },
+              isInsufficientInfo: {
+                type: Type.BOOLEAN,
+                description: "True if document is unreadable, non-medical, or lacks sufficient values/ranges.",
+              },
+              limitationsNote: {
+                type: Type.STRING,
+                description:
+                  "Clear explanation of any missing data, image quality issues, or limitations; empty string if none.",
+              },
+            },
+            required: [
+              "reportOverview",
+              "testNames",
+              "observedValues",
+              "referenceRangesNote",
+              "valuesOutsideRange",
+              "simpleExplanation",
+              "questionsForDoctor",
+              "isInsufficientInfo",
+              "limitationsNote",
+            ],
+          },
+        },
+      });
+
+      return normalizeReport(JSON.parse((response.text ?? "{}").trim()));
+    },
+    async () => {
+      const base64 = fileBuffer.toString("base64");
+      const dataUrl = `data:${mimeType};base64,${base64}`;
+      const filePart: OpenAiContentPart =
+        mimeType === "application/pdf"
+          ? { type: "file", file: { filename: fileName, file_data: dataUrl } }
+          : { type: "image_url", image_url: { url: dataUrl } };
+
+      const openAiSystem = `${systemInstruction}
+
+Return ONLY valid JSON matching this schema:
+{
+  "reportOverview": string,
+  "testNames": string[],
+  "observedValues": [{ "testName": string, "observedValue": string, "unit": string, "referenceRange": string, "flagStatus": "within_range" | "outside_range" | "not_specified", "explanation": string }],
+  "referenceRangesNote": string,
+  "valuesOutsideRange": [{ "testName": string, "observedValue": string, "referenceRange": string, "note": string }],
+  "simpleExplanation": string,
+  "questionsForDoctor": string[],
+  "isInsufficientInfo": boolean,
+  "limitationsNote": string
+}`;
+
+      const parsed = await callOpenAiJson<Partial<ReportAnalysisResult>>(
+        [
+          { role: "system", content: openAiSystem },
+          {
+            role: "user",
+            content: [filePart, { type: "text", text: promptText }],
+          },
+        ],
+        55000
+      );
+
+      return normalizeReport(parsed);
+    }
+  );
 }
 
 interface OpenFdaLabelRecord {
@@ -412,12 +580,10 @@ function truncateField(arr: string[] | undefined, maxChars = 2200): string {
 /**
  * Feature 3: AI Medicine Information Assistant
  * Queries official U.S. FDA Drug Labeling data first, falling back to Google Search grounding
- * for authoritative medical references. Never recommends prescriptions or dosages.
+ * (with OpenAI failover if Gemini hits limits). Never recommends prescriptions or dosages.
  */
 export async function getMedicineInformation(query: string): Promise<MedicineInfoResult> {
-  const ai = getAiClient();
   const cleanQuery = query.trim();
-
   const fdaRecord = await fetchOpenFdaLabel(cleanQuery);
 
   const medicineSchema = {
@@ -460,6 +626,23 @@ export async function getMedicineInformation(query: string): Promise<MedicineInf
 4. NEVER suggest starting, stopping, or changing any medication.
 5. If the medicine name cannot be verified as a real, recognized drug or lacks reliable source data, set found to false and clearly explain the limitation in limitationNote.`;
 
+  const openAiSchemaPrompt = `${safetyRules}
+
+Return ONLY valid JSON with exact keys:
+{
+  "found": boolean,
+  "medicineName": string,
+  "genericName": string,
+  "brandNames": string[],
+  "drugClass": string,
+  "commonUses": string[],
+  "commonSideEffects": string[],
+  "precautions": string[],
+  "warnings": string[],
+  "whenToConsultProfessional": string[],
+  "limitationNote": string
+}`;
+
   if (fdaRecord) {
     const fdaContext = {
       generic_name: fdaRecord.openfda?.generic_name ?? [],
@@ -475,18 +658,30 @@ export async function getMedicineInformation(query: string): Promise<MedicineInf
       adverse_reactions: truncateField(fdaRecord.adverse_reactions),
     };
 
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: `Summarize the following official U.S. FDA Drug Label record for "${cleanQuery}" into patient-friendly educational sections. Do not invent facts outside the verified FDA label and established pharmacology.\n\nFDA Record:\n${JSON.stringify(fdaContext)}`,
-      config: {
-        systemInstruction: safetyRules,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: "application/json",
-        responseSchema: medicineSchema,
-      },
-    });
+    const userPrompt = `Summarize the following official U.S. FDA Drug Label record for "${cleanQuery}" into patient-friendly educational sections. Do not invent facts outside the verified FDA label and established pharmacology.\n\nFDA Record:\n${JSON.stringify(fdaContext)}`;
 
-    const parsed = JSON.parse((response.text ?? "{}").trim()) as Partial<MedicineInfoResult>;
+    const parsed = await withProviderFailover(
+      async () => {
+        const ai = getGeminiClient();
+        const response = await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: userPrompt,
+          config: {
+            systemInstruction: safetyRules,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: "application/json",
+            responseSchema: medicineSchema,
+          },
+        });
+        return JSON.parse((response.text ?? "{}").trim()) as Partial<MedicineInfoResult>;
+      },
+      async () =>
+        callOpenAiJson<Partial<MedicineInfoResult>>([
+          { role: "system", content: openAiSchemaPrompt },
+          { role: "user", content: userPrompt },
+        ])
+    );
+
     const genericLabel =
       fdaRecord.openfda?.generic_name?.[0] || parsed.genericName || cleanQuery;
     const sources: MedicineSource[] = [
@@ -528,90 +723,132 @@ export async function getMedicineInformation(query: string): Promise<MedicineInf
     };
   }
 
-  // Fallback: Use Google Search grounding to retrieve authoritative drug information
-  const groundedSearch = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: `Look up authoritative clinical drug information (such as FDA, DailyMed, MedlinePlus, Mayo Clinic, or NHS) for the medicine query: "${cleanQuery}". Identify whether it is a real, recognized medication, its generic name, brand names, drug class, approved uses, common side effects, precautions, warnings, and when to consult a healthcare professional. Do NOT include dosing recommendations.`,
-    config: {
-      systemInstruction: safetyRules,
-      tools: [{ googleSearch: {} }],
-    },
-  });
+  // Fallback when FDA label did not match directly: Gemini Search grounding or OpenAI fallback
+  return withProviderFailover(
+    async () => {
+      const ai = getGeminiClient();
+      const groundedSearch = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: `Look up authoritative clinical drug information (such as FDA, DailyMed, MedlinePlus, Mayo Clinic, or NHS) for the medicine query: "${cleanQuery}". Identify whether it is a real, recognized medication, its generic name, brand names, drug class, approved uses, common side effects, precautions, warnings, and when to consult a healthcare professional. Do NOT include dosing recommendations.`,
+        config: {
+          systemInstruction: safetyRules,
+          tools: [{ googleSearch: {} }],
+        },
+      });
 
-  const groundingChunks =
-    groundedSearch.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-  const webSources: MedicineSource[] = groundingChunks
-    .map((chunk) => {
-      const web = (chunk as { web?: { uri?: string; title?: string } }).web;
-      if (web?.uri) {
-        return { title: web.title || "Verified Clinical Reference", url: web.uri };
+      const groundingChunks =
+        groundedSearch.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      const webSources: MedicineSource[] = groundingChunks
+        .map((chunk) => {
+          const web = (chunk as { web?: { uri?: string; title?: string } }).web;
+          if (web?.uri) {
+            return { title: web.title || "Verified Clinical Reference", url: web.uri };
+          }
+          return null;
+        })
+        .filter((s): s is MedicineSource => Boolean(s))
+        .slice(0, 4);
+
+      const groundedNotes = groundedSearch.text?.trim() || "";
+      if (!groundedNotes) {
+        return {
+          query: cleanQuery,
+          found: false,
+          verificationStatus: "unverified",
+          medicineName: cleanQuery,
+          genericName: "Unverified",
+          brandNames: [],
+          drugClass: "Unverified",
+          commonUses: [],
+          commonSideEffects: [],
+          precautions: [],
+          warnings: [],
+          whenToConsultProfessional: [
+            "Consult a licensed pharmacist or physician to verify the exact name, ingredients, and safe use of any medication.",
+          ],
+          limitationNote: `We could not verify "${cleanQuery}" in official drug databases or trusted clinical references. Please check the spelling or ask a pharmacist.`,
+          sources: [],
+        };
       }
-      return null;
-    })
-    .filter((s): s is MedicineSource => Boolean(s))
-    .slice(0, 4);
 
-  const groundedNotes = groundedSearch.text?.trim() || "";
-  if (!groundedNotes) {
-    return {
-      query: cleanQuery,
-      found: false,
-      verificationStatus: "unverified",
-      medicineName: cleanQuery,
-      genericName: "Unverified",
-      brandNames: [],
-      drugClass: "Unverified",
-      commonUses: [],
-      commonSideEffects: [],
-      precautions: [],
-      warnings: [],
-      whenToConsultProfessional: [
-        "Consult a licensed pharmacist or physician to verify the exact name, ingredients, and safe use of any medication.",
-      ],
-      limitationNote: `We could not verify "${cleanQuery}" in official drug databases or trusted clinical references. Please check the spelling or ask a pharmacist.`,
-      sources: [],
-    };
-  }
+      const structuredResponse = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: `Structure the following verified clinical lookup notes for "${cleanQuery}" into the required JSON schema. If the notes indicate "${cleanQuery}" is NOT a real or verifiable medication, set found to false.\n\nLookup Notes:\n${groundedNotes}`,
+        config: {
+          systemInstruction: safetyRules,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: "application/json",
+          responseSchema: medicineSchema,
+        },
+      });
 
-  const structuredResponse = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: `Structure the following verified clinical lookup notes for "${cleanQuery}" into the required JSON schema. If the notes indicate "${cleanQuery}" is NOT a real or verifiable medication, set found to false.\n\nLookup Notes:\n${groundedNotes}`,
-    config: {
-      systemInstruction: safetyRules,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: "application/json",
-      responseSchema: medicineSchema,
+      const parsed = JSON.parse(
+        (structuredResponse.text ?? "{}").trim()
+      ) as Partial<MedicineInfoResult>;
+
+      const isVerified = Boolean(parsed.found) && webSources.length > 0;
+
+      return {
+        query: cleanQuery,
+        found: Boolean(parsed.found),
+        verificationStatus: isVerified ? "verified_web" : "unverified",
+        medicineName: parsed.medicineName || cleanQuery,
+        genericName: parsed.genericName || "Not verified",
+        brandNames: Array.isArray(parsed.brandNames) ? parsed.brandNames : [],
+        drugClass: parsed.drugClass || "Not specified",
+        commonUses: Array.isArray(parsed.commonUses) ? parsed.commonUses : [],
+        commonSideEffects: Array.isArray(parsed.commonSideEffects) ? parsed.commonSideEffects : [],
+        precautions: Array.isArray(parsed.precautions) ? parsed.precautions : [],
+        warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
+        whenToConsultProfessional: Array.isArray(parsed.whenToConsultProfessional)
+          ? parsed.whenToConsultProfessional
+          : [
+              "Consult a licensed doctor or pharmacist before taking, combining, or stopping any medication.",
+            ],
+        limitationNote:
+          parsed.limitationNote?.trim() ||
+          (!isVerified
+            ? "Information could not be matched to an official FDA drug label. Please confirm details with a licensed pharmacist."
+            : null),
+        sources: webSources,
+      };
     },
-  });
+    async () => {
+      const parsed = await callOpenAiJson<Partial<MedicineInfoResult>>([
+        { role: "system", content: openAiSchemaPrompt },
+        {
+          role: "user",
+          content: `Provide verified, conservative educational pharmacology information for "${cleanQuery}". Notice that no direct U.S. FDA openFDA label was matched for this exact query, so if you cannot confidently verify it as a real medication, set found to false.`,
+        },
+      ]);
 
-  const parsed = JSON.parse(
-    (structuredResponse.text ?? "{}").trim()
-  ) as Partial<MedicineInfoResult>;
-
-  const isVerified = Boolean(parsed.found) && webSources.length > 0;
-
-  return {
-    query: cleanQuery,
-    found: Boolean(parsed.found),
-    verificationStatus: isVerified ? "verified_web" : "unverified",
-    medicineName: parsed.medicineName || cleanQuery,
-    genericName: parsed.genericName || "Not verified",
-    brandNames: Array.isArray(parsed.brandNames) ? parsed.brandNames : [],
-    drugClass: parsed.drugClass || "Not specified",
-    commonUses: Array.isArray(parsed.commonUses) ? parsed.commonUses : [],
-    commonSideEffects: Array.isArray(parsed.commonSideEffects) ? parsed.commonSideEffects : [],
-    precautions: Array.isArray(parsed.precautions) ? parsed.precautions : [],
-    warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
-    whenToConsultProfessional: Array.isArray(parsed.whenToConsultProfessional)
-      ? parsed.whenToConsultProfessional
-      : [
-          "Consult a licensed doctor or pharmacist before taking, combining, or stopping any medication.",
+      return {
+        query: cleanQuery,
+        found: Boolean(parsed.found),
+        verificationStatus: "unverified",
+        medicineName: parsed.medicineName || cleanQuery,
+        genericName: parsed.genericName || "Not verified",
+        brandNames: Array.isArray(parsed.brandNames) ? parsed.brandNames : [],
+        drugClass: parsed.drugClass || "Not specified",
+        commonUses: Array.isArray(parsed.commonUses) ? parsed.commonUses : [],
+        commonSideEffects: Array.isArray(parsed.commonSideEffects) ? parsed.commonSideEffects : [],
+        precautions: Array.isArray(parsed.precautions) ? parsed.precautions : [],
+        warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
+        whenToConsultProfessional: Array.isArray(parsed.whenToConsultProfessional)
+          ? parsed.whenToConsultProfessional
+          : [
+              "Consult a licensed doctor or pharmacist before taking, combining, or stopping any medication.",
+            ],
+        limitationNote:
+          parsed.limitationNote?.trim() ||
+          "No direct U.S. FDA drug label match was found for this query; please verify official labeling with a pharmacist.",
+        sources: [
+          {
+            title: "MedlinePlus Drug Information Directory",
+            url: "https://medlineplus.gov/druginformation.html",
+          },
         ],
-    limitationNote:
-      parsed.limitationNote?.trim() ||
-      (!isVerified
-        ? "Information could not be matched to an official FDA drug label. Please confirm details with a licensed pharmacist."
-        : null),
-    sources: webSources,
-  };
+      };
+    }
+  );
 }
